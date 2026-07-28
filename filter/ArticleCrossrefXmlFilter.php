@@ -25,6 +25,8 @@ use APP\submission\Submission;
 use DOMDocument;
 use DOMElement;
 use Illuminate\Support\Carbon;
+use PKP\author\contributorRole\ContributorRoleIdentifier;
+use PKP\author\contributorRole\ContributorType;
 use PKP\citation\Citation;
 use PKP\citation\enum\CitationSourceType;
 use PKP\citation\enum\CitationType;
@@ -193,9 +195,8 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         }
 
         // contributors
-        $authors = $publication->getData('authors');
-        if ($authors->count() != 0) {
-            $contributorsNode = $this->createContributorsNode($doc, $publication);
+        $contributorsNode = $this->createContributorsNode($doc, $publication);
+        if ($contributorsNode->hasChildNodes()) {
             $journalArticleNode->appendChild($contributorsNode);
         }
 
@@ -348,13 +349,50 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         $isFirst = true;
         foreach ($publication->getData('authors') as $author) {
             /** @var Author $author */
-            $personNameNode = $doc->createElementNS($deployment->getNamespace(), 'person_name');
-            $personNameNode->setAttribute('contributor_role', 'author');
-            if ($isFirst) {
-                $personNameNode->setAttribute('sequence', 'first');
-            } else {
-                $personNameNode->setAttribute('sequence', 'additional');
+            $contribRoleIds = $author->getContributorRoleIdentifiers();
+
+            // Role 'other' not supported yet in 5.4.0, do not export that role and skip if no other roles are assigned.
+            $contribRoleIds = array_values(array_diff($contribRoleIds, [ContributorRoleIdentifier::OTHER->getName()]));
+            if (empty($contribRoleIds)) {
+                continue;
             }
+
+            // Crossref allows only one role per person_name
+            // prioritize AUTHOR role if present, otherwise use the first role in the list
+            // https://www.crossref.org/documentation/schema-library/markup-guide-metadata-segments/contributors/#00011
+            $contributorRole = in_array(ContributorRoleIdentifier::AUTHOR->getName(), $contribRoleIds)
+                ? ContributorRoleIdentifier::AUTHOR->getName()
+                : $contribRoleIds[0];
+
+            $contributorRole = strtolower(str_replace('_', '-', $contributorRole));
+            $contributorType = $author->getData('contributorType');
+            $sequence = $isFirst ? 'first' : 'additional';
+
+            // Contributor type ORGANIZATION
+            if ($contributorType === ContributorType::ORGANIZATION->getName()) {
+                $organizationNode = $doc->createElementNS($deployment->getNamespace(), 'organization', htmlspecialchars($author->getLocalizedOrganizationName($locale), ENT_COMPAT, 'UTF-8'));
+                $organizationNode->setAttribute('contributor_role', $contributorRole);
+                $organizationNode->setAttribute('sequence', $sequence);
+                $contributorsNode->appendChild($organizationNode);
+                $isFirst = false;
+                continue;
+            }
+
+            // Contributor type ANONYMOUS
+            if ($contributorType === ContributorType::ANONYMOUS->getName()) {
+                $anonymousNode = $doc->createElementNS($deployment->getNamespace(), 'anonymous');
+                $anonymousNode->setAttribute('contributor_role', $contributorRole);
+                $anonymousNode->setAttribute('sequence', $sequence);
+                $this->appendAffiliationsNode($doc, $anonymousNode, $author, $locale);
+                $contributorsNode->appendChild($anonymousNode);
+                $isFirst = false;
+                continue;
+            }
+
+            // Contributor type PERSON
+            $personNameNode = $doc->createElementNS($deployment->getNamespace(), 'person_name');
+            $personNameNode->setAttribute('contributor_role', $contributorRole);
+            $personNameNode->setAttribute('sequence', $sequence);
 
             $familyNames = $author->getFamilyName(null);
             $givenNames = $author->getGivenName(null);
@@ -368,29 +406,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
                 $personNameNode->appendChild($doc->createElementNS($deployment->getNamespace(), 'surname', htmlspecialchars($givenNames[$locale], ENT_COMPAT, 'UTF-8')));
             }
 
-            $affiliationsNode = null;
-            foreach ($author->getAffiliations() as $affiliation) {
-                $institutionName = $affiliation->getLocalizedName($locale);
-                if (trim($institutionName ?? '') === '') {
-                    continue;
-                }
-                if ($affiliationsNode === null) {
-                    $affiliationsNode = $doc->createElementNS($deployment->getNamespace(), 'affiliations');
-                }
-                $institutionNode = $doc->createElementNS($deployment->getNamespace(), 'institution');
-                $institutionNameNode = $doc->createElementNS($deployment->getNamespace(), 'institution_name', htmlspecialchars($institutionName, ENT_COMPAT, 'UTF-8'));
-                $institutionNode->appendChild($institutionNameNode);
-                $rorId = $affiliation->getRor();
-                if ($rorId) {
-                    $institutionIdNode = $doc->createElementNS($deployment->getNamespace(), 'institution_id', $rorId);
-                    $institutionIdNode->setAttribute('type', 'ror');
-                    $institutionNode->appendChild($institutionIdNode);
-                }
-                $affiliationsNode->appendChild($institutionNode);
-            }
-            if ($affiliationsNode !== null) {
-                $personNameNode->appendChild($affiliationsNode);
-            }
+            $this->appendAffiliationsNode($doc, $personNameNode, $author, $locale);
 
             if ($author->getData('orcid')) {
                 $orcidNode = $doc->createElementNS($deployment->getNamespace(), 'ORCID', $author->getData('orcid'));
@@ -425,7 +441,41 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $contributorsNode->appendChild($personNameNode);
             $isFirst = false;
         }
+      
         return $contributorsNode;
+    }
+
+    /**
+     * Append an affiliations node
+     */
+    public function appendAffiliationsNode(DOMDocument $doc, DOMElement $parentNode, Author $author, string $locale): void
+    {
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        $affiliationsNode = null;
+        foreach ($author->getAffiliations() as $affiliation) {
+            $institutionName = $affiliation->getLocalizedName($locale);
+            if (trim($institutionName ?? '') === '') {
+                continue;
+            }
+            if ($affiliationsNode === null) {
+                $affiliationsNode = $doc->createElementNS($deployment->getNamespace(), 'affiliations');
+            }
+            $institutionNode = $doc->createElementNS($deployment->getNamespace(), 'institution');
+            $institutionNode->appendChild(
+                $doc->createElementNS($deployment->getNamespace(), 'institution_name', htmlspecialchars($institutionName, ENT_COMPAT, 'UTF-8'))
+            );
+            if ($rorId = $affiliation->getRor()) {
+                $institutionIdNode = $doc->createElementNS($deployment->getNamespace(), 'institution_id', $rorId);
+                $institutionIdNode->setAttribute('type', 'ror');
+                $institutionNode->appendChild($institutionIdNode);
+            }
+            $affiliationsNode->appendChild($institutionNode);
+        }
+        if ($affiliationsNode) {
+            $parentNode->appendChild($affiliationsNode);
+        }
     }
 
     /**
