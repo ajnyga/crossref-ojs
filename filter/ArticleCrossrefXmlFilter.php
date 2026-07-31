@@ -30,6 +30,7 @@ use PKP\citation\enum\CitationSourceType;
 use PKP\citation\enum\CitationType;
 use PKP\context\Context;
 use PKP\core\PKPApplication;
+use PKP\dataCitation\DataCitation;
 use PKP\db\DAORegistry;
 use PKP\filter\FilterGroup;
 use PKP\i18n\LocaleConversion;
@@ -249,10 +250,6 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         if ($context->getData(Context::SETTING_DOI_VERSIONING) || $plugin->getSetting($context->getId(), 'crossmark')) {
             // crossmark
             $this->appendCrossmarkNode($doc, $journalArticleNode, $this->versionsDois, $publication);
-            // rel:program — only needed for DOI versioning
-            if ($context->getData(Context::SETTING_DOI_VERSIONING)) {
-                $this->appendRelationships($doc, $journalArticleNode, $this->versionsDois);
-            }
         } else {
             // if no crossmark element is used, append program nodes here
             // fr:program (FundRef)
@@ -260,6 +257,10 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             // ai:program (AccessIndicators) element, that contains the license URL
             $this->appendProgramNode($doc, $journalArticleNode, $publication);
         }
+
+        // rel:program — DOI versioning relations (if enabled) and data citation relations
+        $versionsDois = $context->getData(Context::SETTING_DOI_VERSIONING) ? $this->versionsDois : [];
+        $this->appendRelationships($doc, $journalArticleNode, $versionsDois, $publication);
 
         // doi_data
         $dispatcher = $this->_getDispatcher($request);
@@ -855,23 +856,78 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
     }
 
     /**
-     * Create relationships to previous versions
+     * Create relationships to previous versions and to cited data citations
      */
-    public function appendRelationships(DOMDocument $doc, DOMElement $parentNode, array $versionsDois): void
+    public function appendRelationships(DOMDocument $doc, DOMElement $parentNode, array $versionsDois, Publication $publication): void
     {
-        if (!empty($versionsDois)) {
-            /** @var CrossrefExportDeployment $deployment */
-            $deployment = $this->getDeployment();
-            $programNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:program');
-            foreach ($versionsDois as $versionDoi) {
-                $relatedItemNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:related_item');
-                $intraWorkRel = $doc->createElementNS($deployment->getRelNamespace(), 'rel:intra_work_relation', htmlspecialchars($versionDoi, ENT_COMPAT, 'UTF-8'));
-                $intraWorkRel->setAttribute('relationship-type', 'isVersionOf');
-                $intraWorkRel->setAttribute('identifier-type', 'doi');
-                $relatedItemNode->appendChild($intraWorkRel);
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        $programNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:program');
+
+        foreach ($versionsDois as $versionDoi) {
+            $relatedItemNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:related_item');
+            $intraWorkRel = $doc->createElementNS($deployment->getRelNamespace(), 'rel:intra_work_relation', htmlspecialchars($versionDoi, ENT_COMPAT, 'UTF-8'));
+            $intraWorkRel->setAttribute('relationship-type', 'isVersionOf');
+            $intraWorkRel->setAttribute('identifier-type', 'doi');
+            $relatedItemNode->appendChild($intraWorkRel);
+            $programNode->appendChild($relatedItemNode);
+        }
+
+        foreach ($publication->getData('dataCitations') ?? [] as $dataCitation) {
+            $relatedItemNode = $this->createDataCitationRelatedItemNode($doc, $dataCitation);
+            if ($relatedItemNode) {
                 $programNode->appendChild($relatedItemNode);
             }
+        }
+
+        if ($programNode->hasChildNodes()) {
             $parentNode->appendChild($programNode);
         }
+    }
+
+    /**
+     * Create a rel:related_item node for a data citation
+     * 
+     * @param DOMDocument $doc
+     * @param DataCitation $dataCitation
+     * 
+     * @return DOMElement|null
+     *
+     */
+    public function createDataCitationRelatedItemNode(DOMDocument $doc, DataCitation $dataCitation): ?DOMElement
+    {
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        // Only include data citations that have an identifier (DOI, URL, etc.) and a relationship type
+        if (($identifier = $dataCitation->getAttribute('identifier')) && ($identifierType = $dataCitation->getAttribute('identifierType'))) {
+            $identifierType = strtolower($identifierType);
+        } elseif ($identifier = $dataCitation->getAttribute('url')) {
+            $identifierType = 'uri';
+        } else {
+            return null;
+        }
+
+        // Mapping based on JATS4R recommendation (https://jats4r.niso.org/data-citations)
+        $relationshipTypeMapping = [
+            'supporting' => 'references',
+            'generated' => 'isSupplementedBy',
+            'analyzed' => 'references',
+            'non-analyzed' => 'references',
+        ];
+        $relationshipType = $relationshipTypeMapping[$dataCitation->getAttribute('relationshipType')] ?? 'references';
+
+        $relatedItemNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:related_item');
+        if ($title = $dataCitation->getAttribute('title')) {
+            $descriptionNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:description', htmlspecialchars($title, ENT_COMPAT, 'UTF-8'));
+            $relatedItemNode->appendChild($descriptionNode);
+        }
+        $interWorkRel = $doc->createElementNS($deployment->getRelNamespace(), 'rel:inter_work_relation', htmlspecialchars($identifier, ENT_COMPAT, 'UTF-8'));
+        $interWorkRel->setAttribute('relationship-type', $relationshipType);
+        $interWorkRel->setAttribute('identifier-type', $identifierType);
+        $relatedItemNode->appendChild($interWorkRel);
+
+        return $relatedItemNode;
     }
 }
