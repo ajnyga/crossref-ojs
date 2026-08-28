@@ -519,9 +519,9 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
 
-        $funders = $submission->getData('funders')->toArray();
+        $funders = $submission->getData('funders');
 
-        if (empty($funders)) {
+        if ($funders->isEmpty()) {
             return;
         }
 
