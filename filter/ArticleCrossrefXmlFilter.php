@@ -685,7 +685,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         $deployment = $this->getDeployment();
 
         $citations = $publication->getData('citations');
-        if ($citations) {
+        if ($citations->isNotEmpty()) {
             $citationListNode = $doc->createElementNS($deployment->getNamespace(), 'citation_list');
             foreach ($citations as $citation) {
                 /** @var Citation $citation */
